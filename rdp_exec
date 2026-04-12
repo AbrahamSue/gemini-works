@@ -1,0 +1,135 @@
+#!/bin/bash
+#
+# Remote JS Evaluator for Microsoft Edge (CDP)
+# Uses /x/sbin/main.sh framework
+# Supports shebang usage: #!/path/to/rdp_exec [options] -f
+#
+. /x/sbin/main.sh
+
+# defaults
+: ${inHost:="192.168.0.252"}
+: ${inPort:="9222"}
+: ${inFile:=}
+: ${inURL:=}
+: ${inClean:=}
+
+# Target selection logic
+get_target_ws() {
+    local remote_url="http://${inHost}:${inPort}"
+    
+    # 1. Fetch current tabs
+    local json_data=$(curl -s "${remote_url}/json")
+    if [ -z "$json_data" ]; then
+        log "[ERROR] No response from ${remote_url}. Check if Edge is running with --remote-debugging-port."
+        return 1
+    fi
+
+    # 2. Prefer the active/focused page or the first one
+    local ws_url=$(echo "$json_data" | jq -r '
+        map(select(.type == "page")) | 
+        if length > 0 then .[0].webSocketDebuggerUrl else empty end
+    ')
+
+    if [ -z "$ws_url" ] || [ "$ws_url" == "null" ]; then
+        log "[ERROR] Could not find an active page WebSocket URL."
+        return 1
+    fi
+    
+    echo "$ws_url"
+}
+
+# Core evaluation function
+process_eval() {
+    # If a positional argument is provided and inFile is empty, treat it as the file
+    [ -n "$1" ] && [ -z "$inFile" ] && inFile="$1"
+    
+    local remote_url="http://${inHost}:${inPort}"
+    local target_id=""
+    local ws_url=""
+
+    # Handle initial URL if provided - Open in a new tab
+    if [ -n "$inURL" ]; then
+        log "[INFO] Creating new tab for: $inURL"
+        local new_tab_json=$(curl -s -X PUT "${remote_url}/json/new?${inURL}")
+        target_id=$(echo "$new_tab_json" | jq -r '.id')
+        ws_url=$(echo "$new_tab_json" | jq -r '.webSocketDebuggerUrl')
+        
+        if [ -z "$target_id" ] || [ "$target_id" == "null" ]; then
+            log "[ERROR] Failed to create new tab."
+            return 1
+        fi
+        sleep 2 # Brief pause for initial load
+    fi
+
+    # Ensure a script file was specified
+    if [ -z "$inFile" ]; then
+        log "[ERROR] No script file specified. Use -f or --file."
+        return 1
+    fi
+
+    if [ ! -f "$inFile" ]; then
+        log "[ERROR] Script file '$inFile' not found."
+        return 1
+    fi
+
+    # Get target WebSocket if not already determined by new tab creation
+    if [ -z "$ws_url" ]; then
+        ws_url=$(get_target_ws)
+        [ $? -ne 0 ] && return 1
+        # Extract ID for potential cleanup
+        target_id=$(echo "$ws_url" | sed -re 's/^.*\/page\///')
+    fi
+
+    # Read JS and build JSON payload - Strip ALL leading lines starting with #!
+    local js_content=$(sed '1{/^#!/d}; /./,$!d' "$inFile")
+    
+    local payload=$(jq -n -c --arg expr "$js_content" '
+        {
+            id: 1, 
+            method: "Runtime.evaluate", 
+            params: {
+                expression: $expr, 
+                returnByValue: true,
+                awaitPromise: true
+            }
+        }
+    ')
+
+    log "[INFO] Evaluating script from '$inFile' on $ws_url..."
+    
+    # Execute via websocat
+    local result=$(printf "%s\n" "$payload" | websocat -n1 -B 1000000 "$ws_url")
+    
+    # Output result
+    if [ -n "$inVerbose" ]; then
+        echo "$result" | jq '.'
+    else
+        local val=$(echo "$result" | jq -r '.result.result.value // empty')
+        if [ -n "$val" ]; then
+            echo "$val"
+        else
+            echo "$result" | jq -r '.result.exceptionDetails.exception.description // .error.message // "Execution complete (no return value)"'
+        fi
+    fi
+
+    # Cleanup: Close the tab if requested
+    if [ -n "$inClean" ] && [ -n "$target_id" ]; then
+        log "[INFO] Closing tab: $target_id"
+        curl -s "${remote_url}/json/close/${target_id}" > /dev/null
+    fi
+}
+
+# Fix for shebang argument splitting on Linux
+if [ $# -ge 1 ] && [[ "$1" == *" "* ]]; then
+    eval set -- "$1" "${@:2}"
+fi
+
+# Entry point using main.sh main()
+main process_eval 1.2.0 '
+  -f|--file)        inFile="$2"; shift; ;;          # JavaScript file to evaluate
+  -u|--url)         inURL="$2"; shift; ;;           # Initial URL to load on remote
+  -C|--clean)       inClean=y; ;;                   # Close the tab after evaluation
+  -d|--debug)       inDebug=y; ;;                   # Enable debug mode
+  -p|--port)        inPort="$2"; shift; ;;          # Override remote port (default: 9222)
+  -H|--host)        inHost="$2"; shift; ;;          # Override remote host (default: 192.168.0.252)
+' "$@"
