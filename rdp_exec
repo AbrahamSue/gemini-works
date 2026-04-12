@@ -41,22 +41,35 @@ get_target_ws() {
 
 # Core evaluation function
 process_eval() {
-    # If using inProcessAll, inFile should already be set by -f in shebang.
-    # Any remaining arguments in $@ are passed to the JS.
-    
+    # Store initial state to detect if flags were used
+    local url_from_flag="$inURL"
+    local host_from_flag="$inHost"
+    local port_from_flag="$inPort"
+    local clean_from_flag="$inClean"
+
     # Pre-parse: If first arg is a file and inFile not set, it's the script
     if [ -z "$inFile" ] && [ -f "$1" ]; then
         inFile="$1"
         shift
     fi
 
-    # If inFile is still not set, we can't continue
     if [ -z "$inFile" ]; then
         log "[ERROR] No script file specified. Use -f or provide a file path."
         return 1
     fi
 
-    # Parse in-file configurations
+    # 1. Priority: CLI Positional URL (if no flag URL provided)
+    if [ -z "$url_from_flag" ]; then
+        for arg in "$@"; do
+            if [[ "$arg" =~ ^https?:// ]]; then
+                inURL="$arg"
+                log "[INFO] Using positional URL: $inURL"
+                break
+            fi
+        done
+    fi
+
+    # 2. Priority: In-file configurations (only if not already set by CLI)
     if [ -f "$inFile" ]; then
         while read -r line; do
             [[ "$line" =~ ^#!/ ]] && continue
@@ -66,12 +79,12 @@ process_eval() {
                 val="${val%\"}"
                 val="${val#\"}"
                 case "$key" in
-                    host) [ "$inHost" = "192.168.0.252" ] && inHost="$val" ;;
-                    port) [ "$inPort" = "9222" ] && inPort="$val" ;;
+                    host) [ "$host_from_flag" = "192.168.0.252" ] && inHost="$val" ;;
+                    port) [ "$port_from_flag" = "9222" ] && inPort="$val" ;;
                     url)  [ -z "$inURL" ] && inURL="$val" ;;
                 esac
             elif [[ "$line" =~ ^#clean$ ]]; then
-                inClean=y
+                [ -z "$clean_from_flag" ] && inClean=y
             elif [[ "$line" =~ ^[[:space:]]*$ ]]; then
                 continue
             elif [[ ! "$line" =~ ^# ]]; then
@@ -79,15 +92,6 @@ process_eval() {
             fi
         done < "$inFile"
     fi
-
-    # Dynamic URL: If a positional arg looks like a URL and inURL is empty, use it
-    for arg in "$@"; do
-        if [[ "$arg" =~ ^https?:// ]] && [ -z "$inURL" ]; then
-            inURL="$arg"
-            log "[INFO] Using URL from command line: $inURL"
-            break
-        fi
-    done
 
     local remote_url="http://${inHost}:${inPort}"
     local target_id=""
@@ -101,7 +105,7 @@ process_eval() {
         ws_url=$(echo "$new_tab_json" | jq -r '.webSocketDebuggerUrl')
         
         if [ -z "$target_id" ] || [ "$target_id" == "null" ]; then
-            log "[ERROR] Failed to create new tab. Is the remote host/port correct?"
+            log "[ERROR] Failed to create new tab. Check host/port: ${remote_url}"
             return 1
         fi
         sleep 2
@@ -114,8 +118,7 @@ process_eval() {
     fi
 
     # Read JS and build JSON payload
-    # Robustly strip ALL leading comments and shebangs until the first non-comment line
-    local js_content=$(sed -e '/^#!/d' -e '/^#/d' -e '/./,$!d' "$inFile")
+    local js_content=$(sed -e '1{/^#!/d}' -e '/^#\(host\|port\|url\)=/d' -e '/^#clean/d' -e '/./,$!d' "$inFile")
     
     # Inject ARGV into the script
     local argv_json=$(jq -n '$ARGS.positional' --args "$@")
@@ -134,7 +137,6 @@ process_eval() {
     ')
 
     log "[INFO] Evaluating script from '$inFile' on $ws_url..."
-    [ -n "$inVerbose" ] && log "[DEBUG] ARGV: $argv_json"
     
     local result=$(printf "%s\n" "$payload" | websocat -n1 -B 1000000 "$ws_url")
     
@@ -164,8 +166,8 @@ if [ $# -ge 1 ] && [[ "$1" == *" "* ]]; then
     eval set -- "$1" "${@:2}"
 fi
 
-# Entry point using main.sh main()
-main -* process_eval 1.4.1 '
+# Entry point
+main -* process_eval 1.4.2 '
   -f|--file)        inFile="$2"; shift; ;;          # JavaScript file to evaluate
   -u|--url)         inURL="$2"; shift; ;;           # Initial URL to load on remote
   -C|--clean)       inClean=y; ;;                   # Close the tab after evaluation
