@@ -120,9 +120,10 @@ process_eval() {
     # Read JS and build JSON payload
     local js_content=$(sed -e '1{/^#!/d}' -e '/^#\(host\|port\|url\)=/d' -e '/^#clean/d' -e '/./,$!d' "$inFile")
     
-    # Inject ARGV into the script
+    # Inject Context into the script
     local argv_json=$(jq -n '$ARGS.positional' --args "$@")
-    local final_js="const ARGV = ${argv_json}; ${js_content}"
+    local verb_bool=$( [ -n "$inVerbose" ] && echo "true" || echo "false" )
+    local final_js="const ARGV = ${argv_json}; const inVerbose = ${verb_bool}; ${js_content}"
 
     local payload=$(jq -n -c --arg expr "$final_js" '
         {
@@ -140,18 +141,25 @@ process_eval() {
     
     local result=$(printf "%s\n" "$payload" | websocat -n1 -B 1000000 "$ws_url")
     
-    if [ -n "$inVerbose" ]; then
-        echo "$result" | jq '.'
-    else
-        local val=$(echo "$result" | jq -r '.result.result.value // empty')
-        if [ -n "$val" ]; then
-            if echo "$val" | jq -e . >/dev/null 2>&1; then
-                echo "$val" | jq '.'
-            else
-                echo "$val"
-            fi
+    # Process Result
+    local val=$(echo "$result" | jq -r '.result.result.value // empty')
+    
+    if [ -n "$val" ]; then
+        # Check for special stream output format: { _stdout: "...", _stderr: "..." }
+        if echo "$val" | jq -e 'type == "object" and (has("_stdout") or has("_stderr"))' >/dev/null 2>&1; then
+            echo "$val" | jq -r '._stdout // empty'
+            echo "$val" | jq -r '._stderr // empty' >&2
+        elif echo "$val" | jq -e . >/dev/null 2>&1; then
+            echo "$val" | jq '.'
         else
-            echo "$result" | jq -r '.result.exceptionDetails.exception.description // .error.message // "Execution complete (no return value)"'
+            echo "$val"
+        fi
+    else
+        # Handle exceptions or empty returns
+        local err=$(echo "$result" | jq -r '.result.exceptionDetails.exception.description // .error.message // empty')
+        if [ -n "$err" ]; then
+            echo "[JS ERROR] $err" >&2
+            return 1
         fi
     fi
 
@@ -167,7 +175,7 @@ if [ $# -ge 1 ] && [[ "$1" == *" "* ]]; then
 fi
 
 # Entry point
-main -* process_eval 1.4.2 '
+main -* process_eval 1.5.0 '
   -f|--file)        inFile="$2"; shift; ;;          # JavaScript file to evaluate
   -u|--url)         inURL="$2"; shift; ;;           # Initial URL to load on remote
   -C|--clean)       inClean=y; ;;                   # Close the tab after evaluation

@@ -6,12 +6,9 @@
 #clean
 
 (async () => {
-    // If a URL was passed as a positional argument, it's already used by rdp_exec to load the page.
-    // We just need to extract the data from the current page.
-
     // 1. Metadata Collection
     const originalName = document.querySelector('meta[property="og:title"]')?.content || document.title;
-    const referer = window.location.href;
+    const referer = window.location.href.split('#')[0]; // Strip hash for referer
     const userAgent = navigator.userAgent;
 
     // 2. Name Sanitization
@@ -30,7 +27,7 @@
         name = sanitize(rawName);
     }
 
-    // 3. Unpacking function for p,a,c,k,e,d
+    // 3. Unpacking function
     function unpack(p, a, c, k, e, d) {
         e = function (c) {
             return (c < a ? "" : e(parseInt(c / a))) + ((c = c % a) > 35 ? String.fromCharCode(c + 29) : c.toString(36))
@@ -45,9 +42,8 @@
         return p;
     }
 
-    // 4. Find the script and extract parameters
     const script = Array.from(document.querySelectorAll('script')).find(s => s.textContent.includes('eval(function(p,a,c,k,e,d)'));
-    if (!script) return { error: "Packed script not found on " + referer };
+    if (!script) return { error: "Packed script not found" };
 
     const match = script.textContent.match(/}\s*\('(.*)',\s*(\d+),\s*(\d+),\s*'(.*)'\.split\('\|'\),\s*(\d+),\s*({.*})\)\)/);
     if (!match) return { error: "Parameters not matched" };
@@ -55,18 +51,16 @@
     const [_, p, a, c, k, e, d] = match;
     const unpacked = unpack(p, parseInt(a), parseInt(c), k.split('|'), parseInt(e), JSON.parse(d));
 
-    // 5. Extract the Playlist URL
     const urlRegex = /https?:\/\/[^"']+\/playlist\.m3u8[^"']*/g;
     const urlMatch = unpacked.match(urlRegex);
-    if (!urlMatch) return { error: "Playlist URL not found in unpacked code" };
+    if (!urlMatch) return { error: "Playlist URL not found" };
 
     let playlistUrl = urlMatch[0].replace(/\\/g, '');
 
-    // 6. Fetch playlist and get best quality
+    // 4. Fetch playlist and get best quality
     try {
         const response = await fetch(playlistUrl);
         const text = await response.text();
-        
         const lines = text.split('\n');
         let bestQualityFile = '';
         let maxRes = 0;
@@ -91,7 +85,7 @@
 
         const finalUrl = new URL(bestQualityFile, playlistUrl).href;
 
-        return {
+        const result = {
             name: name,
             original_name: originalName,
             referer: referer,
@@ -99,14 +93,19 @@
             playlist_url: playlistUrl,
             best_m3u8: finalUrl
         };
+
+        // 5. Handle Verbose Flag for Shell Output
+        if (typeof inVerbose !== 'undefined' && inVerbose) {
+            const cmd = `dlm3u8 "${name}" "${finalUrl}" CURL_OPTS='-K /x/xbin/missav.curlrc -e ${referer}' ARIA_OPTS='--conf-path /x/xbin/aria.m3u8.missav.conf --referer=${referer}'`;
+            return {
+                _stdout: cmd,
+                _stderr: JSON.stringify(result, null, 2)
+            };
+        }
+
+        return result;
+
     } catch (err) {
-        return {
-            name: name,
-            original_name: originalName,
-            referer: referer,
-            user_agent: userAgent,
-            playlist_url: playlistUrl,
-            error: "Failed to fetch/parse playlist: " + err.message
-        };
+        return { error: err.message };
     }
 })();
