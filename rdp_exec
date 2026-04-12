@@ -3,6 +3,7 @@
 # Remote JS Evaluator for Microsoft Edge (CDP)
 # Uses /x/sbin/main.sh framework
 # Supports shebang usage: #!/path/to/rdp_exec [options] -f
+# Supports in-file config: #host=192.168.0.252 #port=9222 #url=... #clean
 #
 . /x/sbin/main.sh
 
@@ -43,6 +44,31 @@ process_eval() {
     # If a positional argument is provided and inFile is empty, treat it as the file
     [ -n "$1" ] && [ -z "$inFile" ] && inFile="$1"
     
+    # Parse in-file configurations if file exists
+    if [ -f "$inFile" ]; then
+        while read -r line; do
+            [[ "$line" =~ ^#!/ ]] && continue # Skip shebang
+            if [[ "$line" =~ ^#([a-zA-Z]+)=(.*)$ ]]; then
+                key="${BASH_REMATCH[1]}"
+                val="${BASH_REMATCH[2]}"
+                # Remove quotes from val if present
+                val="${val%\"}"
+                val="${val#\"}"
+                case "$key" in
+                    host) [ "$inHost" = "192.168.0.252" ] && inHost="$val" ;;
+                    port) [ "$inPort" = "9222" ] && inPort="$val" ;;
+                    url)  [ -z "$inURL" ] && inURL="$val" ;;
+                esac
+            elif [[ "$line" =~ ^#clean$ ]]; then
+                inClean=y
+            elif [[ "$line" =~ ^[[:space:]]*$ ]]; then
+                continue # Skip empty lines
+            elif [[ ! "$line" =~ ^# ]]; then
+                break # First non-comment line, stop parsing
+            fi
+        done < "$inFile"
+    fi
+
     local remote_url="http://${inHost}:${inPort}"
     local target_id=""
     local ws_url=""
@@ -80,8 +106,8 @@ process_eval() {
         target_id=$(echo "$ws_url" | sed -re 's/^.*\/page\///')
     fi
 
-    # Read JS and build JSON payload - Strip ALL leading lines starting with #!
-    local js_content=$(sed '1{/^#!/d}; /./,$!d' "$inFile")
+    # Read JS and build JSON payload - Strip leading shebang and config comments
+    local js_content=$(sed -e '1{/^#!/d}' -e '/^#\(host\|port\|url\)=/d' -e '/^#clean/d' -e '/./,$!d' "$inFile")
     
     local payload=$(jq -n -c --arg expr "$js_content" '
         {
@@ -125,7 +151,7 @@ if [ $# -ge 1 ] && [[ "$1" == *" "* ]]; then
 fi
 
 # Entry point using main.sh main()
-main process_eval 1.2.0 '
+main process_eval 1.3.0 '
   -f|--file)        inFile="$2"; shift; ;;          # JavaScript file to evaluate
   -u|--url)         inURL="$2"; shift; ;;           # Initial URL to load on remote
   -C|--clean)       inClean=y; ;;                   # Close the tab after evaluation
